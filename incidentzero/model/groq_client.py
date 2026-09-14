@@ -11,9 +11,14 @@ from .errors import PermanentModelError, TransientModelError
 
 
 class GroqModelClient:
-    def __init__(self, api_key: str | None = None, model: str = "openai/gpt-oss-20b") -> None:
-        self.model = model
-        self.client = Groq(api_key=api_key or os.getenv("GROQ_API_KEY"))
+    """Local function-calling only — no browser search, code execution, or remote MCP."""
+
+    def __init__(self, api_key: str | None = None, model: str | None = None) -> None:
+        key = api_key if api_key is not None else os.getenv("GROQ_API_KEY")
+        if not key or key.strip() in {"", "replace_me"}:
+            raise PermanentModelError("GROQ_API_KEY must be set in the environment (never hard-code it).")
+        self.model = model or os.getenv("GROQ_MODEL", "openai/gpt-oss-20b")
+        self.client = Groq(api_key=key)
 
     def _translate_error(self, exc: Exception) -> Exception:
         status = getattr(exc, "status_code", None)
@@ -32,7 +37,7 @@ class GroqModelClient:
                 temperature=0.1,
                 reasoning_effort="low",
             )
-        except Exception as exc:  # provider-specific classes intentionally kept out of student code
+        except Exception as exc:
             raise self._translate_error(exc) from exc
         msg = response.choices[0].message
         calls: list[ToolCall] = []

@@ -14,7 +14,12 @@ class RetryPolicy:
         self.max_attempts = max(1, max_attempts)
         self.sleeper = sleeper
 
-    def call_model(self, fn: Callable[[], T]) -> T:
+    def call_model(
+        self,
+        fn: Callable[[], T],
+        *,
+        on_retry: Callable[[int, TransientModelError], None] | None = None,
+    ) -> T:
         delay = 0.25
         last_exc: TransientModelError | None = None
         for attempt in range(1, self.max_attempts + 1):
@@ -24,6 +29,8 @@ class RetryPolicy:
                 last_exc = exc
                 if attempt >= self.max_attempts:
                     raise
+                if on_retry is not None:
+                    on_retry(attempt, exc)
                 self.sleeper(delay)
                 delay = min(delay * 2, 2.0)
         raise last_exc  # pragma: no cover

@@ -9,6 +9,18 @@ from incidentzero.tools.consequential import tools_requiring_world_version
 from incidentzero.tools.registry import ToolRegistry
 
 _WORLD_VERSION_TOOLS = tools_requiring_world_version()
+_NEAR_BUDGET_ALLOWED = frozenset({
+    "get_incident",
+    "get_service_health",
+    "get_metrics",
+    "get_logs",
+    "get_deployments",
+    "get_dependencies",
+    "get_runbook",
+    "verify_recovery",
+    "close_incident",
+    "escalate_incident",
+})
 
 
 class ToolExecutionGate:
@@ -63,6 +75,14 @@ class ToolExecutionGate:
 
         if budget.remaining_tools <= 0:
             return self._reject(tool, "validation_error", "Tool-call budget exhausted.", retryable=False)
+
+        if budget.critical_exhaustion() and tool not in _NEAR_BUDGET_ALLOWED:
+            return self._reject(
+                tool,
+                "budget_insufficient",
+                "Near budget exhaustion: prioritize verify_recovery or escalate_incident.",
+                retryable=False,
+            )
 
         if not skip_loop_check and self.loop_guard.record(tool, arguments):
             return self._reject(

@@ -39,9 +39,10 @@ def main() -> None:
             model=GroqModelClient(model=args.model),
             tools=registry,
             approval=ConsoleApprovalGateway(),
-            budget=BudgetManager(),
+            budget=BudgetManager.from_config(),
             trace=TraceRecorder(trace_path),
         )
+        controller.budget.start_clock()
         outcome = controller.run()
         print("\n[bold]Outcome[/bold]")
         print(json.dumps(asdict(outcome), indent=2, default=str))

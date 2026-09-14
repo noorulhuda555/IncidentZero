@@ -55,13 +55,29 @@ class AgentController:
         self.retry_policy = RetryPolicy(max_attempts=max_retries)
         self._max_tool_retries = max(0, max_retries - 1)
         self._pending_tool_retries: dict[str, int] = {}
+        self._budget_warning_logged = False
 
     def _record_state(self, label: str) -> None:
         self.trace.record(label, self.state.to_snapshot())
 
+    def _budget_snapshot(self) -> dict[str, Any]:
+        return {
+            "llm_calls": self.budget.llm_calls,
+            "tool_calls": self.budget.tool_calls,
+            "remaining_llm": self.budget.remaining_llm,
+            "remaining_tools": self.budget.remaining_tools,
+            "elapsed_seconds": round(self.budget.elapsed_seconds(), 2),
+        }
+
+    def _maybe_budget_warning(self) -> None:
+        if self.budget.near_exhaustion() and not self._budget_warning_logged:
+            self._budget_warning_logged = True
+            self.trace.record("budget_warning", self._budget_snapshot())
+
     def _outcome(self, status: TerminalStatus, summary: str) -> AgentOutcome:
         self.state.set_terminal_status(status)
         self._record_state("terminal_state")
+        self.trace.record("terminal_result", {"status": status.value, "summary": summary, **self._budget_snapshot()})
         return AgentOutcome(
             status=status.value,
             summary=summary,
@@ -72,16 +88,30 @@ class AgentController:
             trace_path=str(self.trace.path),
         )
 
-    def _with_llm(self, fn: Callable[[], T]) -> T:
+    def _with_llm(self, fn: Callable[[], T], *, purpose: str) -> T:
+        def on_retry(attempt: int, exc: TransientModelError) -> None:
+            self.trace.record("model_retry", {"purpose": purpose, "attempt": attempt, "error": str(exc)})
+
         def attempt() -> T:
             self.state.consume_llm(self.budget)
             return fn()
 
-        return self.retry_policy.call_model(attempt)
+        return self.retry_policy.call_model(attempt, on_retry=on_retry)
 
     def _model_decide(self) -> ModelReply:
-        reply = self._with_llm(lambda: self.model.decide(self.state.messages, self.tools.groq_tools))
-        self.trace.record("model_request", {"llm_calls": self.state.llm_call_count})
+        reply = self._with_llm(
+            lambda: self.model.decide(self.state.messages, self.tools.groq_tools),
+            purpose="decide",
+        )
+        self.trace.record(
+            "model_request",
+            {
+                "purpose": "decide",
+                "llm_calls": self.state.llm_call_count,
+                "usage": reply.usage,
+                "finish_reason": reply.finish_reason,
+            },
+        )
         return reply
 
     def _observe_tool_result(self, tool_name: str, result: dict[str, Any]) -> None:
@@ -140,7 +170,8 @@ class AgentController:
         reason = self.replan_policy.replan_reason(trigger)
         self.trace.record("replan_trigger", {"reason": reason, "trigger": trigger})
         revised = self._with_llm(
-            lambda: self.planner.revise(self.state.plan, trigger, self.state.run_summary())
+            lambda: self.planner.revise(self.state.plan, trigger, self.state.run_summary()),
+            purpose="plan_revise",
         )
         self.state.apply_revised_plan(revised)
         self.trace.record("plan_revised", {"revision": revised.revision, "plan": str(revised)})
@@ -234,7 +265,24 @@ class AgentController:
             self.trace.record("validation_failure", {"call": {"name": call.name, "arguments": call.arguments}, "result": blocked})
             return blocked
         self.state.consume_tool(self.budget)
-        # TODO(A1): ask self.approval before high/critical actions. The LLM cannot approve itself.
+        if self.risk.requires_human_approval(call.name):
+            justification = str(call.arguments.get("reason", "No evidence-based justification provided."))
+            self.trace.record(
+                "approval_request",
+                {"tool": call.name, "arguments": call.arguments, "justification": justification},
+            )
+            approved = self.approval.approve(call.name, call.arguments, justification)
+            self.trace.record("approval_result", {"tool": call.name, "approved": approved})
+            if not approved:
+                return {
+                    "status": "approval_denied",
+                    "tool": call.name,
+                    "world_version": self.tools.environment.world_version,
+                    "evidence_id": None,
+                    "data": None,
+                    "retryable": False,
+                    "message": "Human approval denied for high/critical action.",
+                }
         result = self.tools.invoke(call.name, call.arguments)
         self.state.record_action_fingerprint(call.name, call.arguments)
         self.trace.record("tool_result", {"call": {"name": call.name, "arguments": call.arguments}, "result": result})
@@ -268,6 +316,9 @@ class AgentController:
         )
         self.loop_guard.reset()
         self._pending_tool_retries.clear()
+        self._budget_warning_logged = False
+        if self.budget._started_at is None:
+            self.budget.start_clock()
         try:
             incident = self._execute_tool_call(ToolCall(id="bootstrap", name="get_incident", arguments={}))
             self._observe_tool_result("get_incident", incident)
@@ -275,11 +326,14 @@ class AgentController:
             self.state.append_system_note(f"Current incident evidence: {json.dumps(incident)}")
             self._record_state("state_after_bootstrap")
 
-            self.state.set_plan(self._with_llm(lambda: self.planner.create(incident)))
-            self.trace.record("plan_created", {"plan": str(self.state.plan)})
+            self.state.set_plan(self._with_llm(lambda: self.planner.create(incident), purpose="plan_create"))
+            self.trace.record("plan_created", {"plan": str(self.state.plan), "revision": self.state.plan.revision if self.state.plan else 0})
             self._record_state("state_after_plan")
 
             while self.state.has_budget(self.budget):
+                if self.budget.runtime_exceeded():
+                    return self._outcome(TerminalStatus.BUDGET_EXHAUSTED, "Wall-clock budget exceeded.")
+                self._maybe_budget_warning()
                 reply = self._model_decide()
                 self._append_assistant(reply)
                 self.trace.record("model_reply", {"content": reply.content, "tool_calls": [c.__dict__ if hasattr(c, "__dict__") else {"name": c.name, "arguments": c.arguments} for c in reply.tool_calls]})
@@ -291,6 +345,7 @@ class AgentController:
                     )
 
                 call = reply.tool_calls[0]
+                self.trace.record("tool_proposal", {"call": {"name": call.name, "arguments": call.arguments}})
                 result = self._execute_tool_call(call)
                 self._observe_tool_result(call.name, result)
                 self._append_tool_result(call, result)
