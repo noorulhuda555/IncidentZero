@@ -14,7 +14,7 @@ from .planner import Planner
 from .policies import LoopGuard, ReplanPolicy, RiskPolicy
 from .prompts import SYSTEM_PROMPT
 from .recovery import RetryPolicy
-from .state import AgentState
+from .state import AgentState, TerminalStatus
 
 
 class AgentController:
@@ -44,9 +44,25 @@ class AgentController:
         self.loop_guard = LoopGuard()
         self.retry_policy = RetryPolicy()
 
+    def _record_state(self, label: str) -> None:
+        self.trace.record(label, self.state.to_snapshot())
+
+    def _outcome(self, status: TerminalStatus, summary: str) -> AgentOutcome:
+        self.state.set_terminal_status(status)
+        self._record_state("terminal_state")
+        return AgentOutcome(
+            status=status.value,
+            summary=summary,
+            llm_calls=self.state.llm_call_count,
+            tool_calls=self.state.tool_call_count,
+            final_world_version=self.state.latest_world_version,
+            evidence_ids=list(self.state.evidence_ids),
+            trace_path=str(self.trace.path),
+        )
+
     def _model_decide(self) -> ModelReply:
         # TODO(A1): integrate bounded retries, budget accounting and trace metrics.
-        self.budget.consume_llm()
+        self.state.consume_llm(self.budget)
         return self.model.decide(self.state.messages, self.tools.groq_tools)
 
     def _execute_tool_call(self, call: ToolCall) -> dict[str, Any]:
@@ -60,7 +76,8 @@ class AgentController:
         - stale-precondition handling,
         - retryable tool-error handling where appropriate.
         """
-        self.budget.consume_tool()
+        self.state.consume_tool(self.budget)
+        self.state.record_action_fingerprint(call.name, call.arguments)
         ok, error = self.tools.validate(call.name, call.arguments)
         if not ok:
             return {
@@ -95,52 +112,51 @@ class AgentController:
         })
 
     def run(self) -> AgentOutcome:
-        self.state.messages = [
-            {"role": "system", "content": SYSTEM_PROMPT},
-            {"role": "user", "content": "Investigate the active production incident, mitigate it safely, verify recovery, then close it; otherwise escalate with evidence."},
-        ]
+        self.state.reset_run(
+            SYSTEM_PROMPT,
+            "Investigate the active production incident, mitigate it safely, verify recovery, "
+            "then close it; otherwise escalate with evidence.",
+        )
         try:
-            # Bootstrap with one real observation so the plan is based on environment evidence.
-            self.budget.consume_tool()
+            self.state.consume_tool(self.budget)
             incident = self.tools.execute("get_incident", {})
-            self.state.observe_result(incident)
+            self.state.observe_result("get_incident", incident)
             self.trace.record("bootstrap_incident", incident)
-            self.state.messages.append({"role": "system", "content": f"Current incident evidence: {json.dumps(incident)}"})
+            self.state.append_system_note(f"Current incident evidence: {json.dumps(incident)}")
+            self._record_state("state_after_bootstrap")
 
-            self.budget.consume_llm()
-            self.state.plan = self.planner.create(incident)
+            self.state.consume_llm(self.budget)
+            self.state.set_plan(self.planner.create(incident))
             self.trace.record("plan_created", {"plan": str(self.state.plan)})
+            self._record_state("state_after_plan")
 
-            # Deliberately simple baseline loop. A correct submission must be substantially stronger.
-            while self.budget.remaining_llm > 0 and self.budget.remaining_tools > 0:
+            while self.state.has_budget(self.budget):
                 reply = self._model_decide()
                 self._append_assistant(reply)
                 self.trace.record("model_reply", {"content": reply.content, "tool_calls": [c.__dict__ if hasattr(c, "__dict__") else {"name": c.name, "arguments": c.arguments} for c in reply.tool_calls]})
 
                 if not reply.tool_calls:
-                    return AgentOutcome(
-                        status="failed",
-                        summary="Model stopped without a tool call; baseline controller cannot prove resolution.",
-                        llm_calls=self.budget.llm_calls,
-                        tool_calls=self.budget.tool_calls,
-                        final_world_version=self.state.latest_world_version,
-                        evidence_ids=self.state.evidence_ids,
-                        trace_path=str(self.trace.path),
+                    return self._outcome(
+                        TerminalStatus.FAILED,
+                        "Model stopped without a tool call; baseline controller cannot prove resolution.",
                     )
 
-                # Starter executes only the first call. Parallel calls are disabled in Groq config.
                 call = reply.tool_calls[0]
                 result = self._execute_tool_call(call)
-                self.state.observe_result(result)
+                self.state.observe_result(call.name, result)
                 self._append_tool_result(call, result)
+                self._record_state("state_after_tool")
 
                 if call.name == "close_incident" and result.get("status") == "ok":
-                    return AgentOutcome("resolved", "Incident closed with simulator evidence.", self.budget.llm_calls, self.budget.tool_calls, self.state.latest_world_version, self.state.evidence_ids, str(self.trace.path))
+                    return self._outcome(TerminalStatus.RESOLVED, "Incident closed with simulator evidence.")
                 if call.name == "escalate_incident" and result.get("status") == "ok":
-                    return AgentOutcome("escalated", "Incident escalated with evidence.", self.budget.llm_calls, self.budget.tool_calls, self.state.latest_world_version, self.state.evidence_ids, str(self.trace.path))
+                    return self._outcome(TerminalStatus.ESCALATED, "Incident escalated with evidence.")
 
                 # TODO(A1): distinguish retry, re-plan, abort, verify, and continue.
 
-            return AgentOutcome("budget_exhausted", "Agent budget exhausted before safe termination.", self.budget.llm_calls, self.budget.tool_calls, self.state.latest_world_version, self.state.evidence_ids, str(self.trace.path))
+            return self._outcome(
+                TerminalStatus.BUDGET_EXHAUSTED,
+                "Agent budget exhausted before safe termination.",
+            )
         except BudgetExceeded as exc:
-            return AgentOutcome("budget_exhausted", str(exc), self.budget.llm_calls, self.budget.tool_calls, self.state.latest_world_version, self.state.evidence_ids, str(self.trace.path))
+            return self._outcome(TerminalStatus.BUDGET_EXHAUSTED, str(exc))
