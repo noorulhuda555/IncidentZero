@@ -132,6 +132,9 @@ class LoopGuard:
         self.max_same_action_repeats = max_same_action_repeats
         self._counts: dict[str, int] = {}
 
+    def reset(self) -> None:
+        self._counts.clear()
+
     def record(self, action_name: str, arguments: dict[str, Any]) -> bool:
         """Return True when the exact same action has repeated too often."""
         fp = action_fingerprint(action_name, arguments)

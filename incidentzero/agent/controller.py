@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from pathlib import Path
-from typing import Any
+from typing import Any, TypeVar
 
 from incidentzero.approval.gateway import ApprovalGateway
 from incidentzero.domain.models import AgentOutcome, ModelReply, ToolCall
 from incidentzero.model.base import ModelClient
+from incidentzero.model.errors import PermanentModelError, TransientModelError
 from incidentzero.telemetry.budget import BudgetExceeded, BudgetManager
 from incidentzero.telemetry.trace import TraceRecorder
 from incidentzero.tools.registry import ToolRegistry
@@ -14,9 +16,11 @@ from incidentzero.tools.registry import ToolRegistry
 from .planner import Planner
 from .policies import LoopGuard, PostToolAction, ReplanPolicy, RiskPolicy, ToolOutcomeRouter
 from .prompts import SYSTEM_PROMPT
-from .recovery import RetryPolicy
+from .recovery import RecoveryPolicy, RetryPolicy
 from .state import AgentState, TerminalStatus
 from .tool_gate import ToolExecutionGate
+
+T = TypeVar("T")
 
 
 class AgentController:
@@ -45,9 +49,11 @@ class AgentController:
         self.replan_policy = ReplanPolicy()
         self.outcome_router = ToolOutcomeRouter(self.replan_policy)
         limits = json.loads(Path("configs/limits.json").read_text(encoding="utf-8"))
+        max_retries = int(limits["max_consecutive_model_retries"])
         self.loop_guard = LoopGuard(max_same_action_repeats=int(limits["max_same_action_repeats"]))
         self.tool_gate = ToolExecutionGate(tools, self.risk, self.loop_guard)
-        self.retry_policy = RetryPolicy()
+        self.retry_policy = RetryPolicy(max_attempts=max_retries)
+        self._max_tool_retries = max(0, max_retries - 1)
         self._pending_tool_retries: dict[str, int] = {}
 
     def _record_state(self, label: str) -> None:
@@ -66,10 +72,24 @@ class AgentController:
             trace_path=str(self.trace.path),
         )
 
+    def _with_llm(self, fn: Callable[[], T]) -> T:
+        def attempt() -> T:
+            self.state.consume_llm(self.budget)
+            return fn()
+
+        return self.retry_policy.call_model(attempt)
+
     def _model_decide(self) -> ModelReply:
-        # TODO(A1): integrate bounded retries, budget accounting and trace metrics.
-        self.state.consume_llm(self.budget)
-        return self.model.decide(self.state.messages, self.tools.groq_tools)
+        reply = self._with_llm(lambda: self.model.decide(self.state.messages, self.tools.groq_tools))
+        self.trace.record("model_request", {"llm_calls": self.state.llm_call_count})
+        return reply
+
+    def _observe_tool_result(self, tool_name: str, result: dict[str, Any]) -> None:
+        before = self.state.latest_world_version
+        self.state.observe_result(tool_name, result)
+        after = self.state.latest_world_version
+        if before is not None and after is not None and after > before:
+            self.loop_guard.reset()
 
     def _budget_too_low_for_plan(self) -> bool:
         plan = self.state.plan
@@ -105,7 +125,7 @@ class AgentController:
         fresh = self._execute_tool_call(ToolCall(id="re_observe", name="get_incident", arguments={}))
         if fresh.get("status") != "ok":
             return fresh
-        self.state.observe_result("get_incident", fresh)
+        self._observe_tool_result("get_incident", fresh)
         self.trace.record("re_observe", fresh)
         self.state.append_system_note(
             f"World changed — fresh incident observation (world_version={fresh.get('world_version')}): "
@@ -119,8 +139,9 @@ class AgentController:
         trigger = {**trigger_result, "tool": tool_name}
         reason = self.replan_policy.replan_reason(trigger)
         self.trace.record("replan_trigger", {"reason": reason, "trigger": trigger})
-        self.state.consume_llm(self.budget)
-        revised = self.planner.revise(self.state.plan, trigger, self.state.run_summary())
+        revised = self._with_llm(
+            lambda: self.planner.revise(self.state.plan, trigger, self.state.run_summary())
+        )
         self.state.apply_revised_plan(revised)
         self.trace.record("plan_revised", {"revision": revised.revision, "plan": str(revised)})
         self.state.append_system_note(
@@ -132,7 +153,7 @@ class AgentController:
         """Retry a transient telemetry/action error without a new LLM turn."""
         key = call.id
         attempts = self._pending_tool_retries.get(key, 0)
-        if attempts >= 2 or not self.state.has_budget(self.budget):
+        if attempts >= self._max_tool_retries or not self.state.has_budget(self.budget):
             return None
         self._pending_tool_retries[key] = attempts + 1
         self.trace.record("retry_tool", {"tool": call.name, "attempt": attempts + 1})
@@ -143,6 +164,15 @@ class AgentController:
 
     def _handle_post_tool(self, call: ToolCall, result: dict[str, Any]) -> AgentOutcome | None:
         """Return a terminal outcome, or None to continue the main loop."""
+        if RecoveryPolicy.verify_requires_replan(call.name, result):
+            self._path_replan(result, call.name)
+            return None
+
+        msg = result.get("message") or ""
+        if result.get("status") == "validation_error" and "Repeated identical action blocked" in msg:
+            self._path_replan({"status": "loop_detected", "retryable": False, "message": msg}, call.name)
+            return None
+
         self._mark_plan_progress(call.name, result)
         action = self.outcome_router.decide(
             call.name,
@@ -157,7 +187,7 @@ class AgentController:
             retry_result = self._path_retry_tool(call)
             if retry_result is None:
                 return self._outcome(TerminalStatus.ABORTED, f"Transient error on {call.name} could not be retried.")
-            self.state.observe_result(call.name, retry_result)
+            self._observe_tool_result(call.name, retry_result)
             self._append_tool_result(call, retry_result)
             self._record_state("state_after_tool_retry")
             follow_up = self.outcome_router.decide(call.name, retry_result)
@@ -180,6 +210,16 @@ class AgentController:
                 result.get("message") or f"Non-recoverable failure on {call.name}.",
             )
         return None
+
+    def _close_allowed(self, call: ToolCall, result: dict[str, Any]) -> bool:
+        if call.name != "close_incident" or result.get("status") != "ok":
+            return False
+        cited = call.arguments.get("evidence_ids") or []
+        return (
+            self.state.verification_criteria_met
+            and self.state.last_verify_recovery_evidence_id is not None
+            and self.state.last_verify_recovery_evidence_id in cited
+        )
 
     def _execute_tool_call(self, call: ToolCall, *, skip_loop_check: bool = False) -> dict[str, Any]:
         """Pre-check, then invoke simulator (approval gate added in Phase 4)."""
@@ -226,16 +266,16 @@ class AgentController:
             "Investigate the active production incident, mitigate it safely, verify recovery, "
             "then close it; otherwise escalate with evidence.",
         )
+        self.loop_guard.reset()
         self._pending_tool_retries.clear()
         try:
             incident = self._execute_tool_call(ToolCall(id="bootstrap", name="get_incident", arguments={}))
-            self.state.observe_result("get_incident", incident)
+            self._observe_tool_result("get_incident", incident)
             self.trace.record("bootstrap_incident", incident)
             self.state.append_system_note(f"Current incident evidence: {json.dumps(incident)}")
             self._record_state("state_after_bootstrap")
 
-            self.state.consume_llm(self.budget)
-            self.state.set_plan(self.planner.create(incident))
+            self.state.set_plan(self._with_llm(lambda: self.planner.create(incident)))
             self.trace.record("plan_created", {"plan": str(self.state.plan)})
             self._record_state("state_after_plan")
 
@@ -252,12 +292,12 @@ class AgentController:
 
                 call = reply.tool_calls[0]
                 result = self._execute_tool_call(call)
-                self.state.observe_result(call.name, result)
+                self._observe_tool_result(call.name, result)
                 self._append_tool_result(call, result)
                 self._record_state("state_after_tool")
 
-                if call.name == "close_incident" and result.get("status") == "ok":
-                    return self._outcome(TerminalStatus.RESOLVED, "Incident closed with simulator evidence.")
+                if self._close_allowed(call, result):
+                    return self._outcome(TerminalStatus.RESOLVED, "Incident closed with verified simulator evidence.")
                 if call.name == "escalate_incident" and result.get("status") == "ok":
                     return self._outcome(TerminalStatus.ESCALATED, "Incident escalated with evidence.")
 
@@ -269,5 +309,9 @@ class AgentController:
                 TerminalStatus.BUDGET_EXHAUSTED,
                 "Agent budget exhausted before safe termination.",
             )
+        except PermanentModelError as exc:
+            return self._outcome(TerminalStatus.ABORTED, f"Permanent model error: {exc}")
+        except TransientModelError as exc:
+            return self._outcome(TerminalStatus.ABORTED, f"Model unavailable after retries: {exc}")
         except BudgetExceeded as exc:
             return self._outcome(TerminalStatus.BUDGET_EXHAUSTED, str(exc))

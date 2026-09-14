@@ -53,6 +53,8 @@ class AgentState:
     fingerprint_counts: dict[str, int] = field(default_factory=dict)
     terminal_status: TerminalStatus = TerminalStatus.RUNNING
     plan_history: list[dict[str, Any]] = field(default_factory=list)
+    last_verify_recovery_evidence_id: str | None = None
+    verification_criteria_met: bool = False
 
     _MAX_RECENT_OUTCOMES: int = field(default=8, init=False, repr=False)
 
@@ -84,6 +86,8 @@ class AgentState:
         self.action_fingerprint_history.clear()
         self.fingerprint_counts.clear()
         self.plan_history.clear()
+        self.last_verify_recovery_evidence_id = None
+        self.verification_criteria_met = False
         self.terminal_status = TerminalStatus.RUNNING
 
     def _plan_snapshot(self, plan: AgentPlan) -> dict[str, Any]:
@@ -123,6 +127,7 @@ class AgentState:
 
     def reset_action_fingerprints(self) -> None:
         self.fingerprint_counts.clear()
+        self.action_fingerprint_history.clear()
 
     def record_action_fingerprint(self, tool_name: str, arguments: dict[str, Any]) -> str:
         fp = action_fingerprint(tool_name, arguments)
@@ -140,7 +145,16 @@ class AgentState:
         if isinstance(version, int):
             if self.latest_world_version is not None and version > self.latest_world_version:
                 self.reset_action_fingerprints()
+                self.last_verify_recovery_evidence_id = None
+                self.verification_criteria_met = False
             self.latest_world_version = version
+        if tool_name == "verify_recovery" and result.get("status") == "ok":
+            data = result.get("data") or {}
+            if data.get("criteria_met") and isinstance(evidence, str):
+                self.last_verify_recovery_evidence_id = evidence
+                self.verification_criteria_met = True
+            else:
+                self.verification_criteria_met = False
         record = ToolOutcomeRecord(
             tool=tool_name,
             status=str(result.get("status", "unknown")),
@@ -194,6 +208,8 @@ class AgentState:
             "action_fingerprint_history": list(self.action_fingerprint_history),
             "fingerprint_counts": dict(self.fingerprint_counts),
             "plan_history": list(self.plan_history),
+            "last_verify_recovery_evidence_id": self.last_verify_recovery_evidence_id,
+            "verification_criteria_met": self.verification_criteria_met,
         }
 
     def format_snapshot(self) -> str:

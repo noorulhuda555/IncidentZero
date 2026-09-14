@@ -72,6 +72,39 @@ class ToolExecutionGate:
                 retryable=False,
             )
 
+        if self.risk.requires_human_approval(tool) and not state.evidence_ids:
+            return self._reject(
+                tool,
+                "validation_error",
+                "High/critical actions require at least one evidence id already collected in state.",
+                retryable=False,
+            )
+
+        if tool == "close_incident":
+            cited = arguments.get("evidence_ids") or []
+            if not state.verification_criteria_met or not state.last_verify_recovery_evidence_id:
+                return self._reject(
+                    tool,
+                    "validation_error",
+                    "Run verify_recovery with criteria_met=true before close_incident.",
+                    retryable=False,
+                )
+            if state.last_verify_recovery_evidence_id not in cited:
+                return self._reject(
+                    tool,
+                    "validation_error",
+                    "close_incident must cite the latest verify_recovery evidence id.",
+                    retryable=False,
+                )
+
+        if tool == "escalate_incident" and not state.evidence_ids:
+            return self._reject(
+                tool,
+                "validation_error",
+                "Escalation requires evidence ids gathered during the investigation.",
+                retryable=False,
+            )
+
         if tool in _WORLD_VERSION_TOOLS:
             latest = state.latest_world_version
             expected = arguments.get("expected_world_version")
