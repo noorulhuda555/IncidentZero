@@ -11,7 +11,7 @@ from incidentzero.telemetry.trace import TraceRecorder
 from incidentzero.tools.registry import ToolRegistry
 
 from .planner import Planner
-from .policies import LoopGuard, ReplanPolicy, RiskPolicy
+from .policies import LoopGuard, PostToolAction, ReplanPolicy, RiskPolicy, ToolOutcomeRouter
 from .prompts import SYSTEM_PROMPT
 from .recovery import RetryPolicy
 from .state import AgentState, TerminalStatus
@@ -41,8 +41,10 @@ class AgentController:
         self.planner = Planner(model)
         self.risk = RiskPolicy()
         self.replan_policy = ReplanPolicy()
+        self.outcome_router = ToolOutcomeRouter(self.replan_policy)
         self.loop_guard = LoopGuard()
         self.retry_policy = RetryPolicy()
+        self._pending_tool_retries: dict[str, int] = {}
 
     def _record_state(self, label: str) -> None:
         self.trace.record(label, self.state.to_snapshot())
@@ -65,17 +67,117 @@ class AgentController:
         self.state.consume_llm(self.budget)
         return self.model.decide(self.state.messages, self.tools.groq_tools)
 
-    def _execute_tool_call(self, call: ToolCall) -> dict[str, Any]:
-        """Validate, approve if needed, execute, trace, and return one observation.
+    def _budget_too_low_for_plan(self) -> bool:
+        plan = self.state.plan
+        if plan is None:
+            return False
+        pending = sum(1 for step in plan.steps if step.status != "done")
+        if pending == 0:
+            return False
+        need_llm = max(2, pending + 1)
+        need_tools = max(2, pending + 2)
+        return self.budget.remaining_llm < need_llm or self.budget.remaining_tools < need_tools
 
-        The baseline only validates and executes. Students must add:
-        - malformed-call recovery,
-        - approval for high/critical actions,
-        - loop detection,
-        - budget-aware behavior,
-        - stale-precondition handling,
-        - retryable tool-error handling where appropriate.
-        """
+    def _mark_plan_progress(self, tool_name: str, result: dict[str, Any]) -> None:
+        plan = self.state.plan
+        if plan is None or result.get("status") != "ok":
+            return
+        for step in plan.steps:
+            if step.status == "done":
+                continue
+            if tool_name == "verify_recovery" and "verify" in step.step_id.lower():
+                data = result.get("data") or {}
+                if data.get("criteria_met"):
+                    step.status = "done"
+                return
+            if tool_name in step.objective.lower() or tool_name.replace("_", " ") in step.objective.lower():
+                step.status = "done"
+                return
+
+    def _path_re_observe(self) -> dict[str, Any] | None:
+        """Refresh incident snapshot after the world changed."""
+        if not self.state.has_budget(self.budget):
+            return None
+        self.state.consume_tool(self.budget)
+        fresh = self.tools.execute("get_incident", {})
+        self.state.observe_result("get_incident", fresh)
+        self.trace.record("re_observe", fresh)
+        self.state.append_system_note(
+            f"World changed — fresh incident observation (world_version={fresh.get('world_version')}): "
+            f"{json.dumps(fresh, ensure_ascii=False)}"
+        )
+        return fresh
+
+    def _path_replan(self, trigger_result: dict[str, Any], tool_name: str) -> None:
+        if self.state.plan is None or not self.state.has_budget(self.budget):
+            return
+        trigger = {**trigger_result, "tool": tool_name}
+        reason = self.replan_policy.replan_reason(trigger)
+        self.trace.record("replan_trigger", {"reason": reason, "trigger": trigger})
+        self.state.consume_llm(self.budget)
+        revised = self.planner.revise(self.state.plan, trigger, self.state.run_summary())
+        self.state.apply_revised_plan(revised)
+        self.trace.record("plan_revised", {"revision": revised.revision, "plan": str(revised)})
+        self.state.append_system_note(
+            f"Plan revised (revision={revised.revision}, reason={reason}): {json.dumps(self.state._plan_snapshot(revised), ensure_ascii=False)}"
+        )
+        self._record_state("state_after_replan")
+
+    def _path_retry_tool(self, call: ToolCall) -> dict[str, Any] | None:
+        """Retry a transient telemetry/action error without a new LLM turn."""
+        key = call.id
+        attempts = self._pending_tool_retries.get(key, 0)
+        if attempts >= 2 or not self.state.has_budget(self.budget):
+            return None
+        self._pending_tool_retries[key] = attempts + 1
+        self.trace.record("retry_tool", {"tool": call.name, "attempt": attempts + 1})
+        self.state.consume_tool(self.budget)
+        result = self.tools.execute(call.name, call.arguments)
+        self.trace.record("tool_result", {"call": {"name": call.name, "arguments": call.arguments}, "result": result, "retry": True})
+        return result
+
+    def _handle_post_tool(self, call: ToolCall, result: dict[str, Any]) -> AgentOutcome | None:
+        """Return a terminal outcome, or None to continue the main loop."""
+        self._mark_plan_progress(call.name, result)
+        action = self.outcome_router.decide(
+            call.name,
+            result,
+            budget_low=self._budget_too_low_for_plan(),
+        )
+        self.trace.record("post_tool_action", {"action": action.value, "tool": call.name, "status": result.get("status")})
+
+        if action == PostToolAction.CONTINUE:
+            return None
+        if action == PostToolAction.RETRY:
+            retry_result = self._path_retry_tool(call)
+            if retry_result is None:
+                return self._outcome(TerminalStatus.ABORTED, f"Transient error on {call.name} could not be retried.")
+            self.state.observe_result(call.name, retry_result)
+            self._append_tool_result(call, retry_result)
+            self._record_state("state_after_tool_retry")
+            follow_up = self.outcome_router.decide(call.name, retry_result)
+            if follow_up == PostToolAction.REPLAN:
+                self._path_replan(retry_result, call.name)
+            elif follow_up == PostToolAction.ABORT:
+                return self._outcome(TerminalStatus.ABORTED, f"Tool {call.name} failed after retry.")
+            return None
+        if action == PostToolAction.RE_OBSERVE:
+            self._path_re_observe()
+            if self.replan_policy.should_replan({**result, "tool": call.name}):
+                self._path_replan(result, call.name)
+            return None
+        if action == PostToolAction.REPLAN:
+            self._path_replan(result, call.name)
+            return None
+        if action == PostToolAction.ABORT:
+            return self._outcome(
+                TerminalStatus.ABORTED,
+                result.get("message") or f"Non-recoverable failure on {call.name}.",
+            )
+        return None
+
+    def _execute_tool_call(self, call: ToolCall) -> dict[str, Any]:
+        """Validate, approve if needed, execute, trace, and return one observation."""
         self.state.consume_tool(self.budget)
         self.state.record_action_fingerprint(call.name, call.arguments)
         ok, error = self.tools.validate(call.name, call.arguments)
@@ -117,6 +219,7 @@ class AgentController:
             "Investigate the active production incident, mitigate it safely, verify recovery, "
             "then close it; otherwise escalate with evidence.",
         )
+        self._pending_tool_retries.clear()
         try:
             self.state.consume_tool(self.budget)
             incident = self.tools.execute("get_incident", {})
@@ -152,7 +255,9 @@ class AgentController:
                 if call.name == "escalate_incident" and result.get("status") == "ok":
                     return self._outcome(TerminalStatus.ESCALATED, "Incident escalated with evidence.")
 
-                # TODO(A1): distinguish retry, re-plan, abort, verify, and continue.
+                terminal = self._handle_post_tool(call, result)
+                if terminal is not None:
+                    return terminal
 
             return self._outcome(
                 TerminalStatus.BUDGET_EXHAUSTED,

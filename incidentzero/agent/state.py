@@ -52,6 +52,7 @@ class AgentState:
     action_fingerprint_history: list[str] = field(default_factory=list)
     fingerprint_counts: dict[str, int] = field(default_factory=dict)
     terminal_status: TerminalStatus = TerminalStatus.RUNNING
+    plan_history: list[dict[str, Any]] = field(default_factory=list)
 
     _MAX_RECENT_OUTCOMES: int = field(default=8, init=False, repr=False)
 
@@ -82,9 +83,31 @@ class AgentState:
         self.tool_call_count = 0
         self.action_fingerprint_history.clear()
         self.fingerprint_counts.clear()
+        self.plan_history.clear()
         self.terminal_status = TerminalStatus.RUNNING
 
+    def _plan_snapshot(self, plan: AgentPlan) -> dict[str, Any]:
+        return {
+            "hypothesis": plan.hypothesis,
+            "revision": plan.revision,
+            "rationale_summary": plan.rationale_summary,
+            "steps": [
+                {
+                    "step_id": step.step_id,
+                    "objective": step.objective,
+                    "success_signal": step.success_signal,
+                    "status": step.status,
+                }
+                for step in plan.steps
+            ],
+        }
+
     def set_plan(self, plan: AgentPlan) -> None:
+        self.plan = plan
+
+    def apply_revised_plan(self, plan: AgentPlan) -> None:
+        if self.plan is not None:
+            self.plan_history.append(self._plan_snapshot(self.plan))
         self.plan = plan
 
     def consume_llm(self, budget: BudgetManager) -> None:
@@ -170,6 +193,7 @@ class AgentState:
             "tool_call_count": self.tool_call_count,
             "action_fingerprint_history": list(self.action_fingerprint_history),
             "fingerprint_counts": dict(self.fingerprint_counts),
+            "plan_history": list(self.plan_history),
         }
 
     def format_snapshot(self) -> str:
