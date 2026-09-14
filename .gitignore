@@ -9,4 +9,10 @@ traces/*.jsonl
 artifacts/
 .DS_Store
 incidentzerovenv/
-
+assignment_a.pdf
+implementation_plan.md
+rules.md
+public-a.json
+public-b.json
+public-c.json
+progress_log.md

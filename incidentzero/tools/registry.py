@@ -26,6 +26,10 @@ class ToolRegistry:
             return False, "; ".join(error.message for error in errors[:3])
         return True, None
 
+    def invoke(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
+        """Call the simulator only after controller-side pre-execution checks passed."""
+        return self.environment.execute(name, arguments)
+
     def execute(self, name: str, arguments: dict[str, Any]) -> dict[str, Any]:
         ok, error = self.validate(name, arguments)
         if not ok:
@@ -33,4 +37,4 @@ class ToolRegistry:
                 "status": "validation_error", "tool": name, "world_version": self.environment.world_version,
                 "evidence_id": None, "data": None, "retryable": False, "message": error,
             }
-        return self.environment.execute(name, arguments)
+        return self.invoke(name, arguments)

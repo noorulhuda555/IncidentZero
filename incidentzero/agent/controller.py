@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from pathlib import Path
 from typing import Any
 
 from incidentzero.approval.gateway import ApprovalGateway
@@ -15,6 +16,7 @@ from .policies import LoopGuard, PostToolAction, ReplanPolicy, RiskPolicy, ToolO
 from .prompts import SYSTEM_PROMPT
 from .recovery import RetryPolicy
 from .state import AgentState, TerminalStatus
+from .tool_gate import ToolExecutionGate
 
 
 class AgentController:
@@ -42,7 +44,9 @@ class AgentController:
         self.risk = RiskPolicy()
         self.replan_policy = ReplanPolicy()
         self.outcome_router = ToolOutcomeRouter(self.replan_policy)
-        self.loop_guard = LoopGuard()
+        limits = json.loads(Path("configs/limits.json").read_text(encoding="utf-8"))
+        self.loop_guard = LoopGuard(max_same_action_repeats=int(limits["max_same_action_repeats"]))
+        self.tool_gate = ToolExecutionGate(tools, self.risk, self.loop_guard)
         self.retry_policy = RetryPolicy()
         self._pending_tool_retries: dict[str, int] = {}
 
@@ -98,8 +102,9 @@ class AgentController:
         """Refresh incident snapshot after the world changed."""
         if not self.state.has_budget(self.budget):
             return None
-        self.state.consume_tool(self.budget)
-        fresh = self.tools.execute("get_incident", {})
+        fresh = self._execute_tool_call(ToolCall(id="re_observe", name="get_incident", arguments={}))
+        if fresh.get("status") != "ok":
+            return fresh
         self.state.observe_result("get_incident", fresh)
         self.trace.record("re_observe", fresh)
         self.state.append_system_note(
@@ -132,7 +137,7 @@ class AgentController:
         self._pending_tool_retries[key] = attempts + 1
         self.trace.record("retry_tool", {"tool": call.name, "attempt": attempts + 1})
         self.state.consume_tool(self.budget)
-        result = self.tools.execute(call.name, call.arguments)
+        result = self.tools.invoke(call.name, call.arguments)
         self.trace.record("tool_result", {"call": {"name": call.name, "arguments": call.arguments}, "result": result, "retry": True})
         return result
 
@@ -176,20 +181,22 @@ class AgentController:
             )
         return None
 
-    def _execute_tool_call(self, call: ToolCall) -> dict[str, Any]:
-        """Validate, approve if needed, execute, trace, and return one observation."""
+    def _execute_tool_call(self, call: ToolCall, *, skip_loop_check: bool = False) -> dict[str, Any]:
+        """Pre-check, then invoke simulator (approval gate added in Phase 4)."""
+        blocked = self.tool_gate.check(
+            call.name,
+            call.arguments,
+            self.state,
+            self.budget,
+            skip_loop_check=skip_loop_check,
+        )
+        if blocked is not None:
+            self.trace.record("validation_failure", {"call": {"name": call.name, "arguments": call.arguments}, "result": blocked})
+            return blocked
         self.state.consume_tool(self.budget)
-        self.state.record_action_fingerprint(call.name, call.arguments)
-        ok, error = self.tools.validate(call.name, call.arguments)
-        if not ok:
-            return {
-                "status": "validation_error", "tool": call.name,
-                "world_version": self.tools.environment.world_version,
-                "evidence_id": None, "data": None,
-                "retryable": False, "message": error,
-            }
         # TODO(A1): ask self.approval before high/critical actions. The LLM cannot approve itself.
-        result = self.tools.execute(call.name, call.arguments)
+        result = self.tools.invoke(call.name, call.arguments)
+        self.state.record_action_fingerprint(call.name, call.arguments)
         self.trace.record("tool_result", {"call": {"name": call.name, "arguments": call.arguments}, "result": result})
         return result
 
@@ -221,8 +228,7 @@ class AgentController:
         )
         self._pending_tool_retries.clear()
         try:
-            self.state.consume_tool(self.budget)
-            incident = self.tools.execute("get_incident", {})
+            incident = self._execute_tool_call(ToolCall(id="bootstrap", name="get_incident", arguments={}))
             self.state.observe_result("get_incident", incident)
             self.trace.record("bootstrap_incident", incident)
             self.state.append_system_note(f"Current incident evidence: {json.dumps(incident)}")

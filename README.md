@@ -56,3 +56,4 @@ Read `docs/CONTRACTS.md` before editing. Hidden grading assumes those public int
 Do not modify the simulator to make scenarios easier. The grader uses clean copies and additional hidden scenarios. In particular, do not depend on private fields or anything named `_oracle`, `_root_cause`, or `_scenario_spec`.
 
 The point is to build a robust **controller**, not to reverse-engineer the answer from the simulator source.
+
