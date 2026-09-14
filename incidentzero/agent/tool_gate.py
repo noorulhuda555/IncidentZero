@@ -76,6 +76,14 @@ class ToolExecutionGate:
         if budget.remaining_tools <= 0:
             return self._reject(tool, "validation_error", "Tool-call budget exhausted.", retryable=False)
 
+        if budget.runtime_exceeded():
+            return self._reject(
+                tool,
+                "validation_error",
+                f"Wall-clock budget exhausted ({budget.max_runtime_seconds:.0f}s from configs/limits.json).",
+                retryable=False,
+            )
+
         if budget.critical_exhaustion() and tool not in _NEAR_BUDGET_ALLOWED:
             return self._reject(
                 tool,

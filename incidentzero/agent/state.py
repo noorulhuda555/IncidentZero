@@ -123,7 +123,7 @@ class AgentState:
         self.tool_call_count = budget.tool_calls
 
     def has_budget(self, budget: BudgetManager) -> bool:
-        return budget.remaining_llm > 0 and budget.remaining_tools > 0
+        return budget.remaining_llm > 0 and budget.remaining_tools > 0 and not budget.runtime_exceeded()
 
     def reset_action_fingerprints(self) -> None:
         self.fingerprint_counts.clear()

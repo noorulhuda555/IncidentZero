@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 from rich import print
 
 from incidentzero.agent.controller import AgentController
-from incidentzero.approval.gateway import ConsoleApprovalGateway
+from incidentzero.approval.gateway import AlwaysApproveGateway, ConsoleApprovalGateway
 from incidentzero.environment.engine import SimulationEnvironment
 from incidentzero.model.groq_client import GroqModelClient
 from incidentzero.telemetry.budget import BudgetManager
@@ -25,6 +25,11 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--student-id", required=True)
     run.add_argument("--scenario", default="public-a")
     run.add_argument("--model", default=os.getenv("GROQ_MODEL", "openai/gpt-oss-20b"))
+    run.add_argument(
+        "--auto-approve",
+        action="store_true",
+        help="Approve high/critical actions without interactive console (evaluation only).",
+    )
     return parser
 
 
@@ -35,17 +40,23 @@ def main() -> None:
         env = SimulationEnvironment(args.student_id, args.scenario)
         registry = ToolRegistry(env)
         trace_path = Path("traces") / f"{args.student_id}_{args.scenario}.jsonl"
+        approval = AlwaysApproveGateway() if args.auto_approve else ConsoleApprovalGateway()
+        budget = BudgetManager.from_config()
+        budget.start_clock()
         controller = AgentController(
             model=GroqModelClient(model=args.model),
             tools=registry,
-            approval=ConsoleApprovalGateway(),
-            budget=BudgetManager.from_config(),
+            approval=approval,
+            budget=budget,
             trace=TraceRecorder(trace_path),
         )
-        controller.budget.start_clock()
         outcome = controller.run()
         print("\n[bold]Outcome[/bold]")
         print(json.dumps(asdict(outcome), indent=2, default=str))
+        print(f"\n[dim]Trace:[/dim] {trace_path}")
+        print(f"[dim]Elapsed:[/dim] {budget.elapsed_seconds():.1f}s")
+        print(f"[dim]Plan revision:[/dim] {controller.state.plan_revision}")
+        print(f"[dim]Verify evidence:[/dim] {controller.state.last_verify_recovery_evidence_id}")
 
 
 if __name__ == "__main__":

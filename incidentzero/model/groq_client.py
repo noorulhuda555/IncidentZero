@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from typing import Any
 
 from groq import Groq
@@ -22,9 +23,48 @@ class GroqModelClient:
 
     def _translate_error(self, exc: Exception) -> Exception:
         status = getattr(exc, "status_code", None)
+        text = str(exc)
         if status in {408, 409, 429, 500, 502, 503, 504}:
-            return TransientModelError(str(exc))
-        return PermanentModelError(str(exc))
+            return TransientModelError(text)
+        # Provider sometimes returns 400 when tool-call JSON is truncated; retry is useful.
+        if status == 400 and "tool_use_failed" in text:
+            return TransientModelError(text)
+        if status == 400 and "json_validate_failed" in text:
+            return TransientModelError(text)
+        return PermanentModelError(text)
+
+    def _sanitize_tool_name(self, name: str) -> str:
+        # Some models append channel markers into the tool name string.
+        if "<|" in name:
+            name = name.split("<|", 1)[0]
+        return name.strip()
+
+    def _recover_tool_use_failed(self, exc: Exception) -> ModelReply | None:
+        """If Groq failed parsing tool args, recover a best-effort ToolCall from the failed generation."""
+        text = str(exc)
+        if "tool_use_failed" not in text:
+            return None
+        name_match = re.search(r'"name"\s*:\s*"([^"]+)"', text)
+        if not name_match:
+            return None
+        name = self._sanitize_tool_name(name_match.group(1))
+        if not name:
+            return None
+        args: dict[str, Any] = {}
+        args_match = re.search(r'"arguments"\s*:\s*(\{.*?\})', text, flags=re.DOTALL)
+        if args_match:
+            try:
+                parsed = json.loads(args_match.group(1))
+                if isinstance(parsed, dict):
+                    args = {k: v for k, v in parsed.items() if k != ""}
+            except json.JSONDecodeError:
+                args = {}
+        return ModelReply(
+            content=f"Recovered malformed tool proposal for {name}; controller will validate.",
+            tool_calls=[ToolCall(id="recovered-0", name=name, arguments=args)],
+            usage={},
+            finish_reason="tool_calls",
+        )
 
     def decide(self, messages: list[dict[str, Any]], tools: list[dict[str, Any]]) -> ModelReply:
         try:
@@ -38,15 +78,20 @@ class GroqModelClient:
                 reasoning_effort="low",
             )
         except Exception as exc:
+            recovered = self._recover_tool_use_failed(exc)
+            if recovered is not None:
+                return recovered
             raise self._translate_error(exc) from exc
         msg = response.choices[0].message
         calls: list[ToolCall] = []
         for call in (msg.tool_calls or []):
             try:
-                args = json.loads(call.function.arguments)
+                args = json.loads(call.function.arguments or "{}")
             except Exception:
                 args = {"__malformed_arguments__": call.function.arguments}
-            calls.append(ToolCall(id=call.id, name=call.function.name, arguments=args))
+            if not isinstance(args, dict):
+                args = {"__malformed_arguments__": call.function.arguments}
+            calls.append(ToolCall(id=call.id, name=self._sanitize_tool_name(call.function.name), arguments=args))
         usage = {}
         if getattr(response, "usage", None):
             usage = {

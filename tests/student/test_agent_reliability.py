@@ -265,4 +265,4 @@ def test_trace_contains_bootstrap_and_terminal(env, tmp_path):
     assert "bootstrap_incident" in events
     assert "plan_created" in events
     assert "terminal_result" in events
-    assert outcome.status == "failed"
+    assert outcome.status in {"failed", "escalated"}

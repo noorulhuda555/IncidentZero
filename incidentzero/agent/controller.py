@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import time
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any, TypeVar
@@ -50,12 +51,24 @@ class AgentController:
         self.outcome_router = ToolOutcomeRouter(self.replan_policy)
         limits = json.loads(Path("configs/limits.json").read_text(encoding="utf-8"))
         max_retries = int(limits["max_consecutive_model_retries"])
-        self.loop_guard = LoopGuard(max_same_action_repeats=int(limits["max_same_action_repeats"]))
+        max_repeats = int(limits["max_same_action_repeats"])
+        # Prefer values already loaded onto the injected budget when created via from_config().
+        if getattr(budget, "max_consecutive_model_retries", None):
+            max_retries = int(budget.max_consecutive_model_retries)
+        if getattr(budget, "max_same_action_repeats", None):
+            max_repeats = int(budget.max_same_action_repeats)
+        self.loop_guard = LoopGuard(max_same_action_repeats=max_repeats)
         self.tool_gate = ToolExecutionGate(tools, self.risk, self.loop_guard)
-        self.retry_policy = RetryPolicy(max_attempts=max_retries)
+        self.retry_policy = RetryPolicy(max_attempts=max_retries, sleeper=self._budget_aware_sleep)
         self._max_tool_retries = max(0, max_retries - 1)
         self._pending_tool_retries: dict[str, int] = {}
         self._budget_warning_logged = False
+
+    def _budget_aware_sleep(self, delay: float) -> None:
+        remaining = self.budget.wall_time_remaining()
+        if remaining <= 0:
+            return
+        time.sleep(min(delay, remaining))
 
     def _record_state(self, label: str) -> None:
         self.trace.record(label, self.state.to_snapshot())
@@ -67,12 +80,40 @@ class AgentController:
             "remaining_llm": self.budget.remaining_llm,
             "remaining_tools": self.budget.remaining_tools,
             "elapsed_seconds": round(self.budget.elapsed_seconds(), 2),
+            "max_runtime_seconds": self.budget.max_runtime_seconds,
+            "max_llm_calls": self.budget.max_llm_calls,
+            "max_tool_calls": self.budget.max_tool_calls,
+            "wall_time_remaining": round(self.budget.wall_time_remaining(), 2),
         }
+
+    def _stop_for_limits(self, reason: str) -> AgentOutcome:
+        self.trace.record("budget_exhausted", {"reason": reason, **self._budget_snapshot()})
+        if self.state.evidence_ids and self.budget.can_start_tool():
+            escalate = ToolCall(
+                id="controller-limit-escalate",
+                name="escalate_incident",
+                arguments={
+                    "reason": f"{reason} Escalating with collected evidence rather than continuing.",
+                    "evidence_ids": list(self.state.evidence_ids)[:12],
+                },
+            )
+            try:
+                esc_result = self._execute_tool_call(escalate)
+                self._observe_tool_result(escalate.name, esc_result)
+                if esc_result.get("status") == "ok":
+                    return self._outcome(TerminalStatus.ESCALATED, f"Escalated: {reason}")
+            except BudgetExceeded:
+                pass
+        return self._outcome(TerminalStatus.BUDGET_EXHAUSTED, reason)
 
     def _maybe_budget_warning(self) -> None:
         if self.budget.near_exhaustion() and not self._budget_warning_logged:
             self._budget_warning_logged = True
             self.trace.record("budget_warning", self._budget_snapshot())
+            self.state.append_system_note(
+                "Budget nearly exhausted. Prefer verify_recovery and close_incident if criteria "
+                "can be met, otherwise escalate_incident with evidence. Do not start new exploratory remediations."
+            )
 
     def _outcome(self, status: TerminalStatus, summary: str) -> AgentOutcome:
         self.state.set_terminal_status(status)
@@ -93,6 +134,12 @@ class AgentController:
             self.trace.record("model_retry", {"purpose": purpose, "attempt": attempt, "error": str(exc)})
 
         def attempt() -> T:
+            if not self.budget.can_start_llm():
+                raise BudgetExceeded(
+                    f"Cannot start LLM call under configs/limits.json "
+                    f"(llm={self.budget.llm_calls}/{self.budget.max_llm_calls}, "
+                    f"wall={self.budget.elapsed_seconds():.1f}/{self.budget.max_runtime_seconds:.0f}s)"
+                )
             self.state.consume_llm(self.budget)
             return fn()
 
@@ -331,17 +378,52 @@ class AgentController:
             self._record_state("state_after_plan")
 
             while self.state.has_budget(self.budget):
-                if self.budget.runtime_exceeded():
-                    return self._outcome(TerminalStatus.BUDGET_EXHAUSTED, "Wall-clock budget exceeded.")
+                if self.budget.runtime_exceeded() or not self.budget.can_start_llm():
+                    return self._stop_for_limits(
+                        f"Hit configs/limits.json wall-clock or LLM reserve "
+                        f"({self.budget.elapsed_seconds():.1f}s / {self.budget.max_runtime_seconds:.0f}s, "
+                        f"llm {self.budget.llm_calls}/{self.budget.max_llm_calls})."
+                    )
                 self._maybe_budget_warning()
                 reply = self._model_decide()
                 self._append_assistant(reply)
                 self.trace.record("model_reply", {"content": reply.content, "tool_calls": [c.__dict__ if hasattr(c, "__dict__") else {"name": c.name, "arguments": c.arguments} for c in reply.tool_calls]})
 
+                if self.budget.runtime_exceeded():
+                    return self._stop_for_limits(
+                        f"Wall-clock budget from configs/limits.json exceeded after model call "
+                        f"({self.budget.elapsed_seconds():.1f}s / {self.budget.max_runtime_seconds:.0f}s)."
+                    )
+
                 if not reply.tool_calls:
+                    if self.state.evidence_ids and self.budget.can_start_tool():
+                        escalate = ToolCall(
+                            id="controller-escalate",
+                            name="escalate_incident",
+                            arguments={
+                                "reason": (
+                                    "Model stopped proposing tools before verified recovery; "
+                                    "controller escalates with collected evidence rather than looping."
+                                ),
+                                "evidence_ids": list(self.state.evidence_ids)[:12],
+                            },
+                        )
+                        self.trace.record("tool_proposal", {"call": {"name": escalate.name, "arguments": escalate.arguments}, "source": "controller"})
+                        esc_result = self._execute_tool_call(escalate)
+                        self._observe_tool_result(escalate.name, esc_result)
+                        self._append_tool_result(escalate, esc_result)
+                        if esc_result.get("status") == "ok":
+                            return self._outcome(TerminalStatus.ESCALATED, "Escalated after model stopped without a tool call.")
                     return self._outcome(
                         TerminalStatus.FAILED,
                         "Model stopped without a tool call; baseline controller cannot prove resolution.",
+                    )
+
+                if not self.budget.can_start_tool() and reply.tool_calls[0].name != "escalate_incident":
+                    return self._stop_for_limits(
+                        f"Cannot start tool under configs/limits.json "
+                        f"(tools {self.budget.tool_calls}/{self.budget.max_tool_calls}, "
+                        f"wall {self.budget.elapsed_seconds():.1f}/{self.budget.max_runtime_seconds:.0f}s)."
                     )
 
                 call = reply.tool_calls[0]
@@ -356,13 +438,21 @@ class AgentController:
                 if call.name == "escalate_incident" and result.get("status") == "ok":
                     return self._outcome(TerminalStatus.ESCALATED, "Incident escalated with evidence.")
 
+                if self.budget.runtime_exceeded():
+                    return self._stop_for_limits(
+                        f"Wall-clock budget from configs/limits.json exceeded after tool call "
+                        f"({self.budget.elapsed_seconds():.1f}s / {self.budget.max_runtime_seconds:.0f}s)."
+                    )
+
                 terminal = self._handle_post_tool(call, result)
                 if terminal is not None:
                     return terminal
 
             return self._outcome(
                 TerminalStatus.BUDGET_EXHAUSTED,
-                "Agent budget exhausted before safe termination.",
+                f"Agent budget exhausted under configs/limits.json "
+                f"(llm {self.budget.llm_calls}/{self.budget.max_llm_calls}, "
+                f"tools {self.budget.tool_calls}/{self.budget.max_tool_calls}).",
             )
         except PermanentModelError as exc:
             return self._outcome(TerminalStatus.ABORTED, f"Permanent model error: {exc}")
