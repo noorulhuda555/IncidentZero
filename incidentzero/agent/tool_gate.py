@@ -1,0 +1,95 @@
+from __future__ import annotations
+
+from typing import Any
+
+from incidentzero.agent.policies import LoopGuard, RiskPolicy
+from incidentzero.agent.state import AgentState
+from incidentzero.telemetry.budget import BudgetManager
+from incidentzero.tools.consequential import tools_requiring_world_version
+from incidentzero.tools.registry import ToolRegistry
+
+_WORLD_VERSION_TOOLS = tools_requiring_world_version()
+
+
+class ToolExecutionGate:
+    """Pre-execution checks — invalid or stale calls must not reach the simulator."""
+
+    def __init__(
+        self,
+        registry: ToolRegistry,
+        risk: RiskPolicy,
+        loop_guard: LoopGuard,
+    ) -> None:
+        self.registry = registry
+        self.risk = risk
+        self.loop_guard = loop_guard
+
+    def _reject(
+        self,
+        tool: str,
+        status: str,
+        message: str,
+        *,
+        retryable: bool = False,
+        **extra: Any,
+    ) -> dict[str, Any]:
+        out: dict[str, Any] = {
+            "status": status,
+            "tool": tool,
+            "world_version": self.registry.environment.world_version,
+            "evidence_id": None,
+            "data": None,
+            "retryable": retryable,
+            "message": message,
+        }
+        out.update(extra)
+        return out
+
+    def check(
+        self,
+        tool: str,
+        arguments: dict[str, Any],
+        state: AgentState,
+        budget: BudgetManager,
+        *,
+        skip_loop_check: bool = False,
+    ) -> dict[str, Any] | None:
+        """Return a tool result dict when blocked; None when the simulator may be called."""
+        ok, error = self.registry.validate(tool, arguments)
+        if not ok:
+            return self._reject(tool, "validation_error", error or "Invalid tool call.", retryable=False)
+
+        _ = self.risk.risk(tool)
+
+        if budget.remaining_tools <= 0:
+            return self._reject(tool, "validation_error", "Tool-call budget exhausted.", retryable=False)
+
+        if not skip_loop_check and self.loop_guard.record(tool, arguments):
+            return self._reject(
+                tool,
+                "validation_error",
+                "Repeated identical action blocked; change approach or re-plan.",
+                retryable=False,
+            )
+
+        if tool in _WORLD_VERSION_TOOLS:
+            latest = state.latest_world_version
+            expected = arguments.get("expected_world_version")
+            if latest is None:
+                return self._reject(
+                    tool,
+                    "validation_error",
+                    "Observe the environment first to learn world_version before consequential actions.",
+                    retryable=False,
+                )
+            if expected != latest:
+                return self._reject(
+                    tool,
+                    "stale_precondition",
+                    "expected_world_version does not match latest observed world_version; re-observe, do not patch the version.",
+                    retryable=True,
+                    expected=expected,
+                    actual=latest,
+                )
+
+        return None
