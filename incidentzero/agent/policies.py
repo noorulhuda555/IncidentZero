@@ -5,6 +5,7 @@ from enum import Enum
 from pathlib import Path
 from typing import Any
 
+from incidentzero.agent.state import action_fingerprint
 from incidentzero.domain.models import RiskLevel
 
 
@@ -133,5 +134,7 @@ class LoopGuard:
 
     def record(self, action_name: str, arguments: dict[str, Any]) -> bool:
         """Return True when the exact same action has repeated too often."""
-        # TODO(A1): create a stable action fingerprint and detect looping.
-        return False
+        fp = action_fingerprint(action_name, arguments)
+        count = self._counts.get(fp, 0) + 1
+        self._counts[fp] = count
+        return count > self.max_same_action_repeats
